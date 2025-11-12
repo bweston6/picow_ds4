@@ -13,8 +13,8 @@ target_include_directories(picow_ds4 PRIVATE
 
 target_link_libraries(picow_ds4 PRIVATE
 	hardware_gpio
-	hardware_pwm
 	hardware_pio
+	hardware_pwm
 	m
 	pico_cyw43_arch_none
 	pico_multicore
