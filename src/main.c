@@ -1,153 +1,211 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2023 Brian Starkey <stark3y@gmail.com>
 
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-
-#include "hardware/gpio.h"
-#include "hardware/pwm.h"
-#include "pico/stdlib.h"
-#include "pico/multicore.h"
+#include <stdlib.h>
 
 #include "bt_hid.h"
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/pwm.h"
+#include "hardware/timer.h"
+#include "pico/multicore.h"
+#include "pico/stdlib.h"
+#include "quadrature_encoder.pio.h"
 
-// These magic values are just taken from M0o+, not calibrated for
-// the Tiny chassis.
-#define PWM_MIN 80
-#define PWM_MAX (PWM_MIN + 127)
+#define MIN_MOTOR_VALUE 140
+// aim for frequency of 100Hz
+#define WRAP_VALUE 2549
+#define PERIOD 20 // ms
 
-static inline int8_t clamp8(int16_t value) {
-        if (value > 127) {
-                return 127;
-        } else if (value < -128) {
-                return -128;
-        }
+#define MAX_VELOCITY 30 // steps/20ms
+#define KP 0.1f
 
-        return value;
-}
+#define FRONT_LEFT_SM 0
+#define FRONT_RIGHT_SM 1
+#define REAR_LEFT_SM 2
+#define REAR_RIGHT_SM 3
 
-struct slice {
-	unsigned int slice_num;
-	unsigned int pwm_min;
+struct pwm {
+  unsigned int slice_num;
+  unsigned int channel;
+};
+
+struct motor {
+  int encoder_displacement;
+  int encoder_velocity;
+  struct pwm forward_pwm;
+  struct pwm reverse_pwm;
+  unsigned int encoder_base_gpio;
+  unsigned int forward_gpio;
+  unsigned int reverse_gpio;
 };
 
 struct chassis {
-	struct slice slice_l;
-	struct slice slice_r;
-
-	int8_t l;
-	int8_t r;
+  struct motor front_left;
+  struct motor front_right;
+  struct motor rear_left;
+  struct motor rear_right;
+  PIO encoder_pio;
 };
 
-void init_slice(struct slice *slice, unsigned int slice_num, unsigned int pwm_min, uint8_t pin_a)
-{
-	slice->slice_num = slice_num;
-	slice->pwm_min = pwm_min;
-	gpio_set_function(pin_a, GPIO_FUNC_PWM);
-	gpio_set_function(pin_a + 1, GPIO_FUNC_PWM);
-	pwm_set_wrap(slice->slice_num, slice->pwm_min + 127 + 1);
-	pwm_set_chan_level(slice->slice_num, PWM_CHAN_A, 0);
-	pwm_set_chan_level(slice->slice_num, PWM_CHAN_B, 0);
-	pwm_set_enabled(slice->slice_num, true);
+void init_pwm(struct pwm *pwm, uint8_t gpio_pin) {
+  gpio_set_function(gpio_pin, GPIO_FUNC_PWM);
+
+  pwm->slice_num = pwm_gpio_to_slice_num(gpio_pin);
+  pwm->channel = pwm_gpio_to_channel(gpio_pin);
+
+  pwm_config config = pwm_get_default_config();
+
+  pwm_config_set_wrap(&config, WRAP_VALUE);
+
+  pwm_init(pwm->slice_num, &config, true);
 }
 
-void chassis_init(struct chassis *chassis, uint8_t pin_la, uint8_t pin_ra)
-{
+void chassis_init(struct chassis *chassis) {
+  pio_add_program(chassis->encoder_pio, &quadrature_encoder_program);
+  quadrature_encoder_program_init(chassis->encoder_pio, FRONT_LEFT_SM,
+                                  chassis->front_left.encoder_base_gpio, 0);
+  quadrature_encoder_program_init(chassis->encoder_pio, FRONT_RIGHT_SM,
+                                  chassis->front_right.encoder_base_gpio, 0);
+  quadrature_encoder_program_init(chassis->encoder_pio, REAR_LEFT_SM,
+                                  chassis->rear_left.encoder_base_gpio, 0);
+  quadrature_encoder_program_init(chassis->encoder_pio, REAR_RIGHT_SM,
+                                  chassis->rear_right.encoder_base_gpio, 0);
 
-	init_slice(&chassis->slice_l, pwm_gpio_to_slice_num(pin_la), PWM_MIN, pin_la);
-	init_slice(&chassis->slice_r, pwm_gpio_to_slice_num(pin_ra), PWM_MIN, pin_ra);
+  init_pwm(&chassis->front_left.forward_pwm, chassis->front_left.forward_gpio);
+  init_pwm(&chassis->front_left.reverse_pwm, chassis->front_left.reverse_gpio);
+
+  init_pwm(&chassis->front_right.forward_pwm,
+           chassis->front_right.forward_gpio);
+  init_pwm(&chassis->front_right.reverse_pwm,
+           chassis->front_right.reverse_gpio);
+
+  init_pwm(&chassis->rear_left.forward_pwm, chassis->rear_left.forward_gpio);
+  init_pwm(&chassis->rear_left.reverse_pwm, chassis->rear_left.reverse_gpio);
+
+  init_pwm(&chassis->rear_right.forward_pwm, chassis->rear_right.forward_gpio);
+  init_pwm(&chassis->rear_right.reverse_pwm, chassis->rear_right.reverse_gpio);
 }
 
-static inline uint8_t abs8(int8_t v) {
-	return v < 0 ? -v : v;
+uint16_t motor_level(float x) { return (uint16_t)(x * 1150.0f + 1400.0f); }
+
+float clamp1(float x) {
+  if (x > 1.0f) {
+    return 1.0f;
+  }
+  if (x < -1.0f) {
+    return -1.0f;
+  }
+  return x;
 }
 
-void slice_set_with_brake(struct slice *slice, int8_t value, bool brake)
-{
-	uint8_t mag = abs8(value);
+void motor_set(struct motor *motor, float percent) {
+  percent = clamp1(percent);
+  uint16_t level = 0;
 
-	if (value == 0) {
-		pwm_set_both_levels(slice->slice_num, brake ? slice->pwm_min + 127 : 0, brake ? slice->pwm_min + 127 : 0);
-	} else if (value < 0) {
-		pwm_set_both_levels(slice->slice_num, slice->pwm_min + mag, 0);
-	} else {
-		pwm_set_both_levels(slice->slice_num, 0, slice->pwm_min + mag);
-	}
+  if (percent != 0.0f) {
+    level = motor_level(fabs(percent));
+  }
+
+  if (!signbit(percent)) {
+    pwm_set_chan_level(motor->forward_pwm.slice_num, motor->forward_pwm.channel,
+                       level);
+    pwm_set_chan_level(motor->reverse_pwm.slice_num, motor->reverse_pwm.channel,
+                       0);
+  } else {
+    pwm_set_chan_level(motor->forward_pwm.slice_num, motor->forward_pwm.channel,
+                       0);
+    pwm_set_chan_level(motor->reverse_pwm.slice_num, motor->reverse_pwm.channel,
+                       level);
+  }
 }
 
-void slice_set(struct slice *slice, int8_t value)
-{
-	slice_set_with_brake(slice, value, false);
+void chassis_set(struct chassis *chassis, float front_left, float front_right,
+                 float rear_left, float rear_right) {
+  printf("fr: %f, fr: %f, rl: %f, rr: %f\n", front_left, front_right, rear_left,
+         rear_right);
+
+  motor_set(&chassis->front_left, front_left);
+  motor_set(&chassis->front_right, front_right);
+  motor_set(&chassis->rear_left, rear_left);
+  motor_set(&chassis->rear_right, rear_right);
 }
 
-void chassis_set_raw(struct chassis *chassis, int8_t left, int8_t right)
-{
-	slice_set(&chassis->slice_l, left);
-	slice_set(&chassis->slice_r, right);
+void updateEncoderValues(struct chassis *chassis) {
+  int front_left_displacement =
+      quadrature_encoder_get_count(chassis->encoder_pio, FRONT_LEFT_SM) *
+      -1; // front encoders are backwards
+  int front_right_displacement =
+      quadrature_encoder_get_count(chassis->encoder_pio, FRONT_RIGHT_SM) * -1;
+  int rear_left_displacement =
+      quadrature_encoder_get_count(chassis->encoder_pio, REAR_LEFT_SM);
+  int rear_right_displacement =
+      quadrature_encoder_get_count(chassis->encoder_pio, REAR_RIGHT_SM);
 
-	chassis->l = left;
-	chassis->r = right;
+  chassis->front_left.encoder_velocity =
+      front_left_displacement - chassis->front_left.encoder_displacement;
+  chassis->front_right.encoder_velocity =
+      front_right_displacement - chassis->front_right.encoder_displacement;
+  chassis->rear_left.encoder_velocity =
+      rear_left_displacement - chassis->rear_left.encoder_displacement;
+  chassis->rear_right.encoder_velocity =
+      rear_right_displacement - chassis->rear_right.encoder_displacement;
+
+  printf("fl: %d, fr: %d, rl: %d, rr: %d", chassis->front_left.encoder_velocity,
+         chassis->front_right.encoder_velocity,
+         chassis->rear_left.encoder_velocity,
+         chassis->rear_right.encoder_velocity);
+
+  chassis->front_left.encoder_displacement = front_left_displacement;
+  chassis->front_right.encoder_displacement = front_right_displacement;
+  chassis->rear_left.encoder_displacement = rear_left_displacement;
+  chassis->rear_right.encoder_displacement = rear_right_displacement;
 }
 
-void chassis_set(struct chassis *chassis, int8_t linear, int8_t rot)
-{
-	// Positive rotation == CCW == right goes faster
+int main(void) {
+  stdio_init_all();
 
-	if (linear < -127) {
-		linear = -127;
-	}
+  multicore_launch_core1(bt_main);
 
-	if (rot < -127) {
-		rot = -127;
-	}
+  struct motor front_left = {
+      .forward_gpio = 26, .reverse_gpio = 27, .encoder_base_gpio = 20};
+  struct motor front_right = {
+      .forward_gpio = 17, .reverse_gpio = 16, .encoder_base_gpio = 18};
+  struct motor rear_left = {
+      .forward_gpio = 2, .reverse_gpio = 3, .encoder_base_gpio = 0};
+  struct motor rear_right = {
+      .forward_gpio = 15, .reverse_gpio = 14, .encoder_base_gpio = 12};
 
-	int l = linear - rot;
-	int r = linear + rot;
-	int adj = 0;
+  struct chassis chassis = {.front_left = front_left,
+                            .front_right = front_right,
+                            .rear_left = rear_left,
+                            .rear_right = rear_right,
+                            .encoder_pio = pio0};
 
-	if (l > 127) {
-		adj = l - 127;
-	} else if (l < -127) {
-		adj = l + 127;
-	}else if (r > 127) {
-		adj = r - 127;
-	} else if (r < -127) {
-		adj = r + 127;
-	}
+  chassis_init(&chassis);
 
-	l -= adj;
-	r -= adj;
+  struct bt_hid_state state;
 
-	// FIXME: Motor directions should be a parameter
-	r = -r;
+  while (1) {
+    sleep_ms(PERIOD);
+    bt_hid_get_latest(&state);
+    updateEncoderValues(&chassis);
 
-	chassis_set_raw(chassis, l, r);
-}
+    float throttle = (float)state.r2 / 255.0f - (float)state.l2 / 255.0f;
+    float steering = ((float)state.lx - 127.5f) / 127.5f;
 
-void main(void) {
-	stdio_init_all();
+    float deadzone = 0.05f;
+    if (fabs(steering) < deadzone) {
+      steering = 0.0f;
+    }
 
-	sleep_ms(1000);
-	printf("Hello\n");
+    float left = clamp1(throttle + steering);
+    float right = clamp1(throttle - steering);
+    chassis_set(&chassis, left, right, left, right);
+  }
 
-	multicore_launch_core1(bt_main);
-	// Wait for init (should do a handshake with the fifo here?)
-	sleep_ms(1000);
-
-	struct chassis chassis = { 0 };
-	chassis_init(&chassis, 6, 8);
-
-	struct bt_hid_state state;
-	for ( ;; ) {
-		sleep_ms(20);
-		bt_hid_get_latest(&state);
-		printf("buttons: %04x, l: %d,%d, r: %d,%d, l2,r2: %d,%d hat: %d\n",
-				state.buttons, state.lx, state.ly, state.rx, state.ry,
-				state.l2, state.r2, state.hat);
-
-		float speed_scale = 1.0;
-		int8_t linear = clamp8(-(state.ly - 128) * speed_scale);
-		int8_t rot = clamp8(-(state.rx - 128));
-		chassis_set(&chassis, linear, rot);
-	}
+  return 1;
 }
