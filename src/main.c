@@ -16,12 +16,12 @@
 #include "hid_state_queue_config.h"
 #include "quadrature_encoder.pio.h"
 
-// aim for frequency of 100Hz
 #define WRAP_VALUE 2549
 
+#define DEADZONE 0.1f
+#define K_P 0.0001f
+#define MAX_RPM 1000.0f
 #define STEPS_PER_REV 200
-#define MAX_VELOCITY 30 // steps/20ms
-#define KP 0.1f
 
 #define FRONT_LEFT_SM 0
 #define FRONT_RIGHT_SM 1
@@ -31,18 +31,18 @@
 queue_t hid_state_queue;
 
 struct pwm {
-  unsigned int slice_num;
-  unsigned int channel;
+  uint slice_num;
+  uint channel;
 };
 
 struct motor {
-  int encoder_steps;
+  int32_t encoder_steps;
   float encoder_rpm;
   struct pwm forward_pwm;
   struct pwm reverse_pwm;
-  unsigned int encoder_base_gpio;
-  unsigned int forward_gpio;
-  unsigned int reverse_gpio;
+  uint encoder_base_gpio;
+  uint forward_gpio;
+  uint reverse_gpio;
 };
 
 struct chassis {
@@ -53,7 +53,7 @@ struct chassis {
   PIO encoder_pio;
 };
 
-void init_pwm(struct pwm *pwm, uint8_t gpio_pin) {
+void init_pwm(struct pwm *pwm, uint gpio_pin) {
   gpio_set_function(gpio_pin, GPIO_FUNC_PWM);
 
   pwm->slice_num = pwm_gpio_to_slice_num(gpio_pin);
@@ -106,11 +106,7 @@ float clamp1(float x) {
 
 void motor_set(struct motor *motor, float percent) {
   percent = clamp1(percent);
-  uint16_t level = 0;
-
-  if (percent != 0.0f) {
-    level = motor_level(fabs(percent));
-  }
+  uint16_t level = motor_level(fabs(percent));
 
   if (!signbit(percent)) {
     pwm_set_chan_level(motor->forward_pwm.slice_num, motor->forward_pwm.channel,
@@ -135,23 +131,22 @@ void chassis_set(struct chassis *chassis, float front_left, float front_right,
 }
 
 absolute_time_t last_update = 0;
-
 void updateEncoderValues(struct chassis *chassis) {
-  int front_left_displacement =
+  int32_t front_left_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, FRONT_LEFT_SM) *
       -1; // front encoders are backwards
-  int front_right_displacement =
+  int32_t front_right_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, FRONT_RIGHT_SM) * -1;
-  int rear_left_displacement =
+  int32_t rear_left_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, REAR_LEFT_SM);
-  int rear_right_displacement =
+  int32_t rear_right_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, REAR_RIGHT_SM);
 
   absolute_time_t now = get_absolute_time();
   int64_t us_since_last_update = absolute_time_diff_us(last_update, now);
   last_update = now;
 
-  float mins_since_last_update = (float)us_since_last_update / 6e+7;
+  double mins_since_last_update = (double)us_since_last_update / 6e+7;
 
   chassis->front_left.encoder_rpm =
       ((float)(front_left_displacement - chassis->front_left.encoder_steps) /
@@ -174,6 +169,20 @@ void updateEncoderValues(struct chassis *chassis) {
   chassis->front_right.encoder_steps = front_right_displacement;
   chassis->rear_left.encoder_steps = rear_left_displacement;
   chassis->rear_right.encoder_steps = rear_right_displacement;
+}
+
+float map_steering(float x, float deadzone) {
+  if (x > deadzone) {
+    return (x - deadzone) / (1 - deadzone);
+  }
+  if (x < -deadzone) {
+    return (x + deadzone) / (1 - deadzone);
+  }
+  return 0.0f;
+}
+
+float pid(float input, float set_point) {
+  return clamp1(rear_left_last + (set_point - input) * K_P);
 }
 
 int main(void) {
@@ -201,16 +210,13 @@ int main(void) {
 
   struct bt_hid_state hid_state;
 
-  float max_rpm = 1000.0f;
-  float front_left_last = 0.0f;
-  float front_right_last = 0.0f;
-  float rear_left_last = 0.0f;
-  float rear_right_last = 0.0f;
-  float k_p = 0.0001f;
-  float deadzone = 0.05f;
+  float front_left, front_left_last, front_right, front_right_last, left_target,
+      rear_left, rear_left_last, rear_right, rear_right_last, right_target,
+      steering, throttle;
 
-  float throttle, steering, left_target, right_target, front_left, front_right,
-      rear_left, rear_right;
+  front_left = front_left_last = front_right = front_right_last = left_target =
+      rear_left = rear_left_last = rear_right = rear_right_last = right_target =
+          steering = throttle = 0.0f;
 
   while (1) {
     // get controller input
@@ -221,22 +227,20 @@ int main(void) {
     throttle = (float)hid_state.r2 / 255.0f - (float)hid_state.l2 / 255.0f;
     steering = ((float)hid_state.lx - 127.5f) / 127.5f;
 
-    if (fabs(steering) < deadzone) {
-      steering = 0.0f;
-    }
+    steering = map_steering(steering, DEADZONE);
 
-    left_target = clamp1(throttle + steering) * max_rpm;
-    right_target = clamp1(throttle - steering) * max_rpm;
+    left_target = clamp1(throttle + steering) * MAX_RPM;
+    right_target = clamp1(throttle - steering) * MAX_RPM;
 
     front_left = clamp1(front_left_last +
-                        (left_target - chassis.front_left.encoder_rpm) * k_p);
+                        (left_target - chassis.front_left.encoder_rpm) * K_P);
     front_right =
         clamp1(front_right_last +
-               (right_target - chassis.front_right.encoder_rpm) * k_p);
+               (right_target - chassis.front_right.encoder_rpm) * K_P);
     rear_left = clamp1(rear_left_last +
-                       (left_target - chassis.rear_left.encoder_rpm) * k_p);
+                       (left_target - chassis.rear_left.encoder_rpm) * K_P);
     rear_right = clamp1(rear_right_last +
-                        (right_target - chassis.rear_right.encoder_rpm) * k_p);
+                        (right_target - chassis.rear_right.encoder_rpm) * K_P);
 
     chassis_set(&chassis, front_left, front_right, rear_left, rear_right);
 
