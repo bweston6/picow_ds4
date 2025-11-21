@@ -14,6 +14,7 @@
 
 #include "bt_hid.h"
 #include "hid_state_queue_config.h"
+#include "pid.h"
 #include "quadrature_encoder.pio.h"
 
 #define WRAP_VALUE 2549
@@ -40,6 +41,7 @@ struct motor {
   float encoder_rpm;
   struct pwm forward_pwm;
   struct pwm reverse_pwm;
+  struct pid pid;
   uint encoder_base_gpio;
   uint forward_gpio;
   uint reverse_gpio;
@@ -66,6 +68,14 @@ void init_pwm(struct pwm *pwm, uint gpio_pin) {
   pwm_init(pwm->slice_num, &config, true);
 }
 
+void init_pid(struct pid *pid) {
+  pid->k_p = K_P;
+  pid->k_i = 0.0f;
+  pid->k_d = 0.0f;
+  pid->last_update = get_absolute_time();
+  pid->last_input = 0.0f;
+}
+
 void chassis_init(struct chassis *chassis) {
   pio_add_program(chassis->encoder_pio, &quadrature_encoder_program);
   quadrature_encoder_program_init(chassis->encoder_pio, FRONT_LEFT_SM,
@@ -79,17 +89,21 @@ void chassis_init(struct chassis *chassis) {
 
   init_pwm(&chassis->front_left.forward_pwm, chassis->front_left.forward_gpio);
   init_pwm(&chassis->front_left.reverse_pwm, chassis->front_left.reverse_gpio);
+  init_pid(&chassis->front_left.pid);
 
   init_pwm(&chassis->front_right.forward_pwm,
            chassis->front_right.forward_gpio);
   init_pwm(&chassis->front_right.reverse_pwm,
            chassis->front_right.reverse_gpio);
+  init_pid(&chassis->front_right.pid);
 
   init_pwm(&chassis->rear_left.forward_pwm, chassis->rear_left.forward_gpio);
   init_pwm(&chassis->rear_left.reverse_pwm, chassis->rear_left.reverse_gpio);
+  init_pid(&chassis->rear_left.pid);
 
   init_pwm(&chassis->rear_right.forward_pwm, chassis->rear_right.forward_gpio);
   init_pwm(&chassis->rear_right.reverse_pwm, chassis->rear_right.reverse_gpio);
+  init_pid(&chassis->rear_right.pid);
 }
 
 uint16_t motor_level(float x) { return (uint16_t)(x * 2550.0f); }
@@ -181,8 +195,8 @@ float map_steering(float x, float deadzone) {
   return 0.0f;
 }
 
-float pid(float input, float set_point) {
-  return clamp1(rear_left_last + (set_point - input) * K_P);
+void e_stop(struct chassis *chassis) {
+  chassis_set(chassis, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 int main(void) {
@@ -218,9 +232,19 @@ int main(void) {
       rear_left = rear_left_last = rear_right = rear_right_last = right_target =
           steering = throttle = 0.0f;
 
+  absolute_time_t last_input;
+
   while (1) {
     // get controller input
-    queue_try_remove(&hid_state_queue, &hid_state);
+    if (queue_try_remove(&hid_state_queue, &hid_state)) {
+      last_input = get_absolute_time();
+    }
+    // emergency stop if we have can't poll input for more than 1s
+    if (absolute_time_diff_us(last_input, get_absolute_time()) > 1000000) {
+      e_stop(&chassis);
+      continue;
+    }
+
     // get encoder input
     updateEncoderValues(&chassis);
 
