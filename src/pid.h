@@ -10,7 +10,6 @@ struct pid {
   absolute_time_t last_update;
   float error_sum;
   float last_error;
-  float last_input;
 };
 
 #endif

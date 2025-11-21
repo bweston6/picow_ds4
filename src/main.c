@@ -21,6 +21,8 @@
 
 #define DEADZONE 0.1f
 #define K_P 0.0001f
+#define K_I 0.0f
+#define K_D 0.0f
 #define MAX_RPM 1000.0f
 #define STEPS_PER_REV 200
 
@@ -70,10 +72,9 @@ void init_pwm(struct pwm *pwm, uint gpio_pin) {
 
 void init_pid(struct pid *pid) {
   pid->k_p = K_P;
-  pid->k_i = 0.0f;
-  pid->k_d = 0.0f;
+  pid->k_i = K_I;
+  pid->k_d = K_D;
   pid->last_update = get_absolute_time();
-  pid->last_input = 0.0f;
 }
 
 void chassis_init(struct chassis *chassis) {
@@ -199,6 +200,20 @@ void e_stop(struct chassis *chassis) {
   chassis_set(chassis, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
+float pid(struct pid *pid, float input, float target) {
+  float error = input - target;
+  float p = pid->k_p * error;
+
+  pid->error_sum += error;
+  float i = pid->k_i * pid->error_sum;
+
+  absolute_time_t now = get_absolute_time();
+  float d = pid->k_d * ((error - pid->last_error) / (absolute_time_diff_us(pid->last_update, now)));
+  pid->last_update = now;
+
+  return p + i + d;
+}
+
 int main(void) {
   stdio_init_all();
 
@@ -256,22 +271,16 @@ int main(void) {
     left_target = clamp1(throttle + steering) * MAX_RPM;
     right_target = clamp1(throttle - steering) * MAX_RPM;
 
-    front_left = clamp1(front_left_last +
-                        (left_target - chassis.front_left.encoder_rpm) * K_P);
-    front_right =
-        clamp1(front_right_last +
-               (right_target - chassis.front_right.encoder_rpm) * K_P);
-    rear_left = clamp1(rear_left_last +
-                       (left_target - chassis.rear_left.encoder_rpm) * K_P);
-    rear_right = clamp1(rear_right_last +
-                        (right_target - chassis.rear_right.encoder_rpm) * K_P);
+    front_left = pid(&chassis.front_left.pid, chassis.front_left.encoder_rpm,
+                     left_target);
+    front_right = pid(&chassis.front_right.pid, chassis.front_right.encoder_rpm,
+                      right_target);
+    rear_left =
+        pid(&chassis.rear_left.pid, chassis.rear_left.encoder_rpm, left_target);
+    rear_right = pid(&chassis.rear_right.pid, chassis.rear_right.encoder_rpm,
+                     right_target);
 
     chassis_set(&chassis, front_left, front_right, rear_left, rear_right);
-
-    front_left_last = left_target == 0.0f ? 0.0f : front_left;
-    front_right_last = right_target == 0.0f ? 0.0f : front_right;
-    rear_left_last = left_target == 0.0f ? 0.0f : rear_left;
-    rear_right_last = right_target == 0.0f ? 0.0f : rear_right;
   }
 
   return 1;
