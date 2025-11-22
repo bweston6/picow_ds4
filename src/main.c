@@ -20,10 +20,10 @@
 #define WRAP_VALUE 2549
 
 #define DEADZONE 0.1f
-#define K_P 0.0001f
+#define K_P 0.004f
 #define K_I 0.0f
 #define K_D 0.0f
-#define MAX_RPM 1000.0f
+#define MAX_RPM 1200.0f
 #define STEPS_PER_REV 200
 
 #define FRONT_LEFT_SM 0
@@ -138,7 +138,6 @@ void motor_set(struct motor *motor, float percent) {
 
 void chassis_set(struct chassis *chassis, float front_left, float front_right,
                  float rear_left, float rear_right) {
-
   motor_set(&chassis->front_left, front_left);
   motor_set(&chassis->front_right, front_right);
   motor_set(&chassis->rear_left, rear_left);
@@ -201,14 +200,15 @@ void e_stop(struct chassis *chassis) {
 }
 
 float pid(struct pid *pid, float input, float target) {
-  float error = input - target;
+  float error = target - input;
   float p = pid->k_p * error;
 
   pid->error_sum += error;
   float i = pid->k_i * pid->error_sum;
 
   absolute_time_t now = get_absolute_time();
-  float d = pid->k_d * ((error - pid->last_error) / (absolute_time_diff_us(pid->last_update, now)));
+  float d = pid->k_d * ((error - pid->last_error) /
+                        (absolute_time_diff_us(pid->last_update, now)));
   pid->last_update = now;
 
   return p + i + d;
@@ -248,14 +248,24 @@ int main(void) {
           steering = throttle = 0.0f;
 
   absolute_time_t last_input;
+  absolute_time_t last_loop = get_absolute_time();
+  absolute_time_t now;
 
   while (1) {
+    // aim for 240Hz
+    now = get_absolute_time();
+    if (absolute_time_diff_us(last_loop, get_absolute_time()) < 4166) {
+      continue;
+    }
+    last_loop = now;
+
+
     // get controller input
     if (queue_try_remove(&hid_state_queue, &hid_state)) {
       last_input = get_absolute_time();
     }
     // emergency stop if we have can't poll input for more than 1s
-    if (absolute_time_diff_us(last_input, get_absolute_time()) > 1000000) {
+    if (absolute_time_diff_us(last_input, get_absolute_time()) >= 1000000) {
       e_stop(&chassis);
       continue;
     }
@@ -279,6 +289,8 @@ int main(void) {
         pid(&chassis.rear_left.pid, chassis.rear_left.encoder_rpm, left_target);
     rear_right = pid(&chassis.rear_right.pid, chassis.rear_right.encoder_rpm,
                      right_target);
+
+    /* printf("\033[Ai: %f, t: %f, o: %f\n", chassis.front_left.encoder_rpm, left_target, front_left); */
 
     chassis_set(&chassis, front_left, front_right, rear_left, rear_right);
   }

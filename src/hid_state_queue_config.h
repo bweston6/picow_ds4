@@ -22,6 +22,6 @@ extern queue_t hid_state_queue;
 
 // Define queue parameters for easy changing
 #define QUEUE_ELEMENT_SIZE sizeof(struct bt_hid_state)
-#define QUEUE_DEPTH 8 // A small queue to show "full" state
+#define QUEUE_DEPTH 1 // A small queue to show "full" state
 
 #endif
