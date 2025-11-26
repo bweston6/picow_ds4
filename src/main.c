@@ -20,6 +20,7 @@
 #define WRAP_VALUE 2549
 
 #define DEADZONE 0.1f
+#define STEERING_WEIGHT 1.0f
 #define K_P 0.004f
 #define K_I 0.0f
 #define K_D 0.0f
@@ -185,13 +186,16 @@ void updateEncoderValues(struct chassis *chassis) {
   chassis->rear_right.encoder_steps = rear_right_displacement;
 }
 
-float map_steering(float x, float deadzone) {
+float map_steering(float x, float y, float deadzone) {
+  x = clamp1(x / (1 + STEERING_WEIGHT * fabs(y)));
+
   if (x > deadzone) {
     return (x - deadzone) / (1 - deadzone);
   }
   if (x < -deadzone) {
     return (x + deadzone) / (1 - deadzone);
   }
+
   return 0.0f;
 }
 
@@ -259,7 +263,6 @@ int main(void) {
     }
     last_loop = now;
 
-
     // get controller input
     if (queue_try_remove(&hid_state_queue, &hid_state)) {
       last_input = get_absolute_time();
@@ -276,7 +279,7 @@ int main(void) {
     throttle = (float)hid_state.r2 / 255.0f - (float)hid_state.l2 / 255.0f;
     steering = ((float)hid_state.lx - 127.5f) / 127.5f;
 
-    steering = map_steering(steering, DEADZONE);
+    steering = map_steering(steering, throttle, DEADZONE);
 
     left_target = clamp1(throttle + steering) * MAX_RPM;
     right_target = clamp1(throttle - steering) * MAX_RPM;
@@ -290,7 +293,8 @@ int main(void) {
     rear_right = pid(&chassis.rear_right.pid, chassis.rear_right.encoder_rpm,
                      right_target);
 
-    /* printf("\033[Ai: %f, t: %f, o: %f\n", chassis.front_left.encoder_rpm, left_target, front_left); */
+    /* printf("\033[Ai: %f, t: %f, o: %f\n", chassis.front_left.encoder_rpm,
+     * left_target, front_left); */
 
     chassis_set(&chassis, front_left, front_right, rear_left, rear_right);
   }
