@@ -32,6 +32,9 @@
 #define REAR_LEFT_SM 2
 #define REAR_RIGHT_SM 3
 
+#define COAST 0.0f
+#define BRAKE -0.0f
+
 queue_t hid_state_queue;
 
 struct pwm {
@@ -40,14 +43,14 @@ struct pwm {
 };
 
 struct motor {
-  int32_t encoder_steps;
   float encoder_rpm;
-  struct pwm forward_pwm;
-  struct pwm reverse_pwm;
+  int32_t encoder_steps;
   struct pid pid;
+  struct pwm mot_a_pwm;
+  struct pwm mot_b_pwm;
   uint encoder_base_gpio;
-  uint forward_gpio;
-  uint reverse_gpio;
+  uint mot_a_gpio;
+  uint mot_b_gpio;
 };
 
 struct chassis {
@@ -89,22 +92,20 @@ void chassis_init(struct chassis *chassis) {
   quadrature_encoder_program_init(chassis->encoder_pio, REAR_RIGHT_SM,
                                   chassis->rear_right.encoder_base_gpio, 0);
 
-  init_pwm(&chassis->front_left.forward_pwm, chassis->front_left.forward_gpio);
-  init_pwm(&chassis->front_left.reverse_pwm, chassis->front_left.reverse_gpio);
+  init_pwm(&chassis->front_left.mot_a_pwm, chassis->front_left.mot_a_gpio);
+  init_pwm(&chassis->front_left.mot_b_pwm, chassis->front_left.mot_b_gpio);
   init_pid(&chassis->front_left.pid);
 
-  init_pwm(&chassis->front_right.forward_pwm,
-           chassis->front_right.forward_gpio);
-  init_pwm(&chassis->front_right.reverse_pwm,
-           chassis->front_right.reverse_gpio);
+  init_pwm(&chassis->front_right.mot_a_pwm, chassis->front_right.mot_a_gpio);
+  init_pwm(&chassis->front_right.mot_b_pwm, chassis->front_right.mot_b_gpio);
   init_pid(&chassis->front_right.pid);
 
-  init_pwm(&chassis->rear_left.forward_pwm, chassis->rear_left.forward_gpio);
-  init_pwm(&chassis->rear_left.reverse_pwm, chassis->rear_left.reverse_gpio);
+  init_pwm(&chassis->rear_left.mot_a_pwm, chassis->rear_left.mot_a_gpio);
+  init_pwm(&chassis->rear_left.mot_b_pwm, chassis->rear_left.mot_b_gpio);
   init_pid(&chassis->rear_left.pid);
 
-  init_pwm(&chassis->rear_right.forward_pwm, chassis->rear_right.forward_gpio);
-  init_pwm(&chassis->rear_right.reverse_pwm, chassis->rear_right.reverse_gpio);
+  init_pwm(&chassis->rear_right.mot_a_pwm, chassis->rear_right.mot_a_gpio);
+  init_pwm(&chassis->rear_right.mot_b_pwm, chassis->rear_right.mot_b_gpio);
   init_pid(&chassis->rear_right.pid);
 }
 
@@ -124,15 +125,25 @@ void motor_set(struct motor *motor, float percent) {
   percent = clamp1(percent);
   uint16_t level = motor_level(fabs(percent));
 
-  if (!signbit(percent)) {
-    pwm_set_chan_level(motor->forward_pwm.slice_num, motor->forward_pwm.channel,
+  if (percent > 0.0f) {
+    // forwards
+    pwm_set_chan_level(motor->mot_a_pwm.slice_num, motor->mot_a_pwm.channel,
                        level);
-    pwm_set_chan_level(motor->reverse_pwm.slice_num, motor->reverse_pwm.channel,
-                       0);
-  } else {
-    pwm_set_chan_level(motor->forward_pwm.slice_num, motor->forward_pwm.channel,
-                       0);
-    pwm_set_chan_level(motor->reverse_pwm.slice_num, motor->reverse_pwm.channel,
+    pwm_set_chan_level(motor->mot_b_pwm.slice_num, motor->mot_b_pwm.channel, 0);
+  } else if (percent == 0.0f && !signbit(percent)) {
+    // coast
+    pwm_set_chan_level(motor->mot_a_pwm.slice_num, motor->mot_a_pwm.channel, 0);
+    pwm_set_chan_level(motor->mot_b_pwm.slice_num, motor->mot_b_pwm.channel, 0);
+  } else if (percent == 0.0f && signbit(percent)) {
+    // brake
+    pwm_set_chan_level(motor->mot_a_pwm.slice_num, motor->mot_a_pwm.channel,
+                       2550.0f);
+    pwm_set_chan_level(motor->mot_b_pwm.slice_num, motor->mot_b_pwm.channel,
+                       2550.0f);
+  } else if (percent < 0.0f) {
+    // backwards
+    pwm_set_chan_level(motor->mot_a_pwm.slice_num, motor->mot_a_pwm.channel, 0);
+    pwm_set_chan_level(motor->mot_b_pwm.slice_num, motor->mot_b_pwm.channel,
                        level);
   }
 }
@@ -148,14 +159,13 @@ void chassis_set(struct chassis *chassis, float front_left, float front_right,
 absolute_time_t last_update = 0;
 void updateEncoderValues(struct chassis *chassis) {
   int32_t front_left_displacement =
-      quadrature_encoder_get_count(chassis->encoder_pio, FRONT_LEFT_SM) *
-      -1; // front encoders are backwards
+      quadrature_encoder_get_count(chassis->encoder_pio, FRONT_LEFT_SM);
   int32_t front_right_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, FRONT_RIGHT_SM) * -1;
   int32_t rear_left_displacement =
       quadrature_encoder_get_count(chassis->encoder_pio, REAR_LEFT_SM);
   int32_t rear_right_displacement =
-      quadrature_encoder_get_count(chassis->encoder_pio, REAR_RIGHT_SM);
+      quadrature_encoder_get_count(chassis->encoder_pio, REAR_RIGHT_SM) * -1;
 
   absolute_time_t now = get_absolute_time();
   int64_t us_since_last_update = absolute_time_diff_us(last_update, now);
@@ -200,7 +210,7 @@ float map_steering(float x, float y, float deadzone) {
 }
 
 void e_stop(struct chassis *chassis) {
-  chassis_set(chassis, 0.0f, 0.0f, 0.0f, 0.0f);
+  chassis_set(chassis, BRAKE, BRAKE, BRAKE, BRAKE);
 }
 
 float pid(struct pid *pid, float input, float target) {
@@ -215,7 +225,13 @@ float pid(struct pid *pid, float input, float target) {
                         (absolute_time_diff_us(pid->last_update, now)));
   pid->last_update = now;
 
-  return p + i + d;
+  float sum = p + i + d;
+
+  if (signbit(input) == signbit(target) && signbit(sum) != signbit(input)) {
+    return BRAKE;
+  }
+
+  return sum;
 }
 
 int main(void) {
@@ -225,13 +241,13 @@ int main(void) {
   multicore_launch_core1(bt_main);
 
   struct motor front_left_motor = {
-      .forward_gpio = 26, .reverse_gpio = 27, .encoder_base_gpio = 20};
-  struct motor front_right_motor = {
-      .forward_gpio = 17, .reverse_gpio = 16, .encoder_base_gpio = 18};
+      .mot_a_gpio = 1, .mot_b_gpio = 0, .encoder_base_gpio = 2};
   struct motor rear_left_motor = {
-      .forward_gpio = 2, .reverse_gpio = 3, .encoder_base_gpio = 0};
+      .mot_a_gpio = 5, .mot_b_gpio = 4, .encoder_base_gpio = 6};
   struct motor rear_right_motor = {
-      .forward_gpio = 15, .reverse_gpio = 14, .encoder_base_gpio = 12};
+      .mot_a_gpio = 8, .mot_b_gpio = 9, .encoder_base_gpio = 10};
+  struct motor front_right_motor = {
+      .mot_a_gpio = 12, .mot_b_gpio = 13, .encoder_base_gpio = 14};
 
   struct chassis chassis = {.front_left = front_left_motor,
                             .front_right = front_right_motor,
@@ -292,9 +308,6 @@ int main(void) {
         pid(&chassis.rear_left.pid, chassis.rear_left.encoder_rpm, left_target);
     rear_right = pid(&chassis.rear_right.pid, chassis.rear_right.encoder_rpm,
                      right_target);
-
-    /* printf("\033[Ai: %f, t: %f, o: %f\n", chassis.front_left.encoder_rpm,
-     * left_target, front_left); */
 
     chassis_set(&chassis, front_left, front_right, rear_left, rear_right);
   }
